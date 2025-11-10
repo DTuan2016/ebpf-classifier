@@ -556,20 +556,54 @@ if __name__ == '__main__':
         map_bpf_table(data_min,        params['data_min'],        'int64_t')
         map_bpf_table(data_scale,      params['data_scale'],      'int64_t')
         prev = 0
-        interval = 100
+        interval = 120
         start = datetime.now()
+        prev_total_bytes = 0
+        prev_total_pkts  = 0
+        latencies = []
+
         while True:
             try:
                 dropcnt.clear()
                 start1 = datetime.now()
+                total_bytes = 0
+                total_pkts = 0
+                interval_latencies = []
+
+                # sleep 1 giây, trong khi BPF update dropcnt và features
                 time.sleep(1)
                 end = datetime.now()
-                for k, v in dropcnt.items():
-                    print(v.value)
-                    ret.append(int(v.value / (end - start1).total_seconds()))
-                duration = (end - start).total_seconds()
-                if duration > interval:
+
+                # Lấy tất cả session để tính throughput & latency
+                sessions = b.get_table("sessions")
+                for k, leaf in sessions.items():
+                    total_pkts  += leaf.num_packets
+                    total_bytes += leaf.features[0]  # tổng bytes
+                    if leaf.num_packets > 1:
+                        # dùng tính trung bình delta timestamp (ns)
+                        interval_latencies.append(leaf.features[1] / leaf.num_packets)
+
+                # Throughput Mbps
+                duration_sec = (end - start1).total_seconds()
+                delta_bytes = total_bytes - prev_total_bytes
+                throughput_mbps = (delta_bytes * 8) / (duration_sec * 1e6)
+                prev_total_bytes = total_bytes
+
+                # Latency trung bình (microseconds)
+                avg_latency_us = 0
+                if interval_latencies:
+                    avg_latency_us = sum(interval_latencies)/len(interval_latencies)/1000.0
+
+                print(f"Drop PPS: {[int(v.value/duration_sec) for k,v in dropcnt.items()]}, "
+                      f"Throughput: {throughput_mbps:.2f} Mbps, "
+                      f"Avg Latency: {avg_latency_us:.2f} us")
+
+                ret.append((throughput_mbps, avg_latency_us))
+
+                # Thoát sau interval giây
+                if (end - start).total_seconds() > interval:
                     break
+
             except KeyboardInterrupt:
                 break
     finally:
