@@ -57,3 +57,5 @@ logs
 *.pdf
 jupyter/.ipynb_checkpoints/
 results
+
+nn-filter/out
