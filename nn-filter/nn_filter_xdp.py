@@ -474,7 +474,7 @@ if __name__ == '__main__':
     if len(sys.argv) < 3 or len(sys.argv) > 4:
         usage()
     device = sys.argv[1]
-    resdir = sys.argv[2]
+    log_file = sys.argv[2]
     maptype = "percpu_array"
     flags = 0
     offload_device = None
@@ -505,7 +505,7 @@ if __name__ == '__main__':
 
     print(offload_device)
 
-    ret = []
+    ret = []  
     # b = BPF(text=bpf_text, debug=0,  cflags=["-w", "-DMAPTYPE={maptype}"],
     b = BPF(text=bpf_text, debug=0,  cflags=["-w"],
             # allow_rlimit=True,
@@ -585,7 +585,11 @@ if __name__ == '__main__':
 
                 # Throughput Mbps
                 duration_sec = (end - start1).total_seconds()
-                delta_bytes = total_bytes - prev_total_bytes
+                delta_bytes = abs(total_bytes - prev_total_bytes)
+                if delta_bytes < 0:
+                  delta_bytes = 0
+                  print(f"[WARN] total_bytes reset? prev={prev_total_bytes}, now={total_bytes}")
+                  
                 throughput_mbps = (delta_bytes * 8) / (duration_sec * 1e6)
                 prev_total_bytes = total_bytes
 
@@ -605,16 +609,22 @@ if __name__ == '__main__':
                     break
 
             except KeyboardInterrupt:
+                filename = log_file
+                os.makedirs(os.path.dirname(filename), exist_ok=True)
+                with open (filename, 'w') as f:
+                    for d in ret:
+                        f.write(f"{d}\n")
                 break
     finally:
         b.remove_xdp(device, flags)
-        filename = f"{resdir}/rxpps.log"
-        if "-S" in sys.argv:
-            # XDP_FLAGS_SKB_MODE
-            filename = f"{resdir}/rxpps.log"
-        if "-D" in sys.argv:
-            filename = f"{resdir}/rxpps.log"
-        with open (filename, 'w') as f:
-            for d in ret:
-                f.write(f"{d}\n")
+        # filename = log_file
+        # if "-S" in sys.argv:
+        #     # XDP_FLAGS_SKB_MODE
+        #     filename = log_file
+        # if "-D" in sys.argv:
+        #     filename = log_file
+        # os.makedirs(os.path.dirname(filename), exist_ok=True)
+        # with open (filename, 'w') as f:
+        #     for d in ret:
+        #         f.write(f"{d}\n")
 
