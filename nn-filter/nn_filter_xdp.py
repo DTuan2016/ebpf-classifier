@@ -55,6 +55,14 @@ struct pkt_leaf_t {
   u64 features[6];
 };
 
+struct accounting{
+  u64 time_in;
+  u64 proc_time;
+  u32 total_bytes;
+  u32 total_pkts;
+};
+
+BPF_HASH(accounting_map, u32, struct accounting, 1);
 BPF_PERCPU_ARRAY(out_input2, int64_t, 16);
 BPF_PERCPU_ARRAY(out_input, int64_t, 16);
 // BPF_ARRAY(out_input2, int64_t, 16);
@@ -206,6 +214,7 @@ int nn1(struct xdp_md *ctx) {
     out = MAX(out, 0);
     out_input2.update(&_m, &out);
   }
+  bpf_trace_printk("JUMP TO NN2!");
   jmp_table.call(ctx, 1);
   return XDP_DROP;
 }
@@ -270,6 +279,20 @@ int nn2(struct xdp_md *ctx) {
   vp = dropcnt.lookup_or_init(&_zero, &val);
   *vp += 1;
   // jmp_table.call(ctx, 2);
+  bpf_trace_printk("JUMP TO NN????!");
+  u32 key_ac = 0;
+  struct accounting *acct = accounting_map.lookup(&key_ac);
+  struct accounting zero_ac =  {};
+  if(!acct){
+    accounting_map.update(&key_ac, &zero_ac);
+    acct = accounting_map.lookup(&key_ac);
+  }
+  if(acct){
+    u64 time_out = bpf_ktime_get_ns();
+    acct->proc_time += time_out - acct->time_in; 
+    
+    bpf_trace_printk("UPDATE FOR ACCOUNTING_MAP proc_time= %u, total_bytes=%u, total_pkts=%d", acct->proc_time, acct->total_bytes, acct->total_pkts); 
+  }
   return XDP_DROP;
   return XDP_PASS;
 }
@@ -349,12 +372,24 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
       pkt_leaf = sessions.lookup(&pkt_key);
     }
     if (pkt_leaf != NULL) {
+      u32 key_ac = 0;
+      struct accounting *acct = accounting_map.lookup(&key_ac);
+      struct accounting zero_ac =  {};
+      u64 pkt_len = 0;
+      if(!acct){
+        accounting_map.update(&key_ac, &zero_ac);
+        acct = accounting_map.lookup(&key_ac);
+      }    
+      if(acct){
+        acct->time_in = bpf_ktime_get_ns();
+      }
       int64_t x[INPUT_DIM] = {0};
       pkt_leaf->num_packets += 1;
       x[0] = pkt_leaf->sport;
       x[1] = pkt_leaf->dport;
       x[2] = iph->protocol;
       x[3] = ntohs(iph->tot_len);
+      pkt_len = (__u64)x[3];
       x[4] = 0;
       if (pkt_leaf->last_packet_timestamp > 0) {
         x[4] = ts - pkt_leaf->last_packet_timestamp;
@@ -444,6 +479,11 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
         out = MAX(out, 0);
         out_input.update(&_m, &out);
       }
+      bpf_trace_printk("JUMP TO NN1!");
+      if(acct){
+        acct->total_bytes += pkt_len;
+        acct->total_pkts += 1;
+      }
       jmp_table.call(ctx, 0);
     }
   }
@@ -469,6 +509,37 @@ def map_bpf_table(hashmap, values, c_type='int'):
         else:
             new_values[i] = ct.c_longlong(values[i])
     hashmap.items_update_batch(keys, new_values)
+
+def read_accounting(acct_map):
+    key = ct.c_uint(0)
+    try:
+        return acct_map[key]
+    except KeyError:
+        # Trả về struct rỗng nếu chưa có entry
+        class Accounting(ct.Structure):
+            _fields_ = [
+                ("time_in", ct.c_ulonglong),
+                ("proc_time", ct.c_ulonglong),
+                ("total_bytes", ct.c_uint),
+                ("total_pkts", ct.c_uint),
+            ]
+        return Accounting()
+      
+def compute_metrics(prev, now, interval):
+    delta_bytes = now.total_bytes - prev.total_bytes
+    delta_pkts  = now.total_pkts  - prev.total_pkts
+    delta_proc  = now.proc_time   - prev.proc_time  # ns
+
+    # Chống counter reset
+    if delta_bytes < 0: delta_bytes = 0
+    if delta_pkts  < 0: delta_pkts  = 0
+    if delta_proc  < 0: delta_proc  = 0
+
+    throughput_bps = delta_bytes / interval if interval > 0 else 0
+    pps            = delta_pkts  / interval if interval > 0 else 0
+    avg_latency_ns = (delta_proc / delta_pkts) if delta_pkts > 0 else 0
+
+    return throughput_bps, avg_latency_ns, pps
 
 if __name__ == '__main__':
     if len(sys.argv) < 3 or len(sys.argv) > 4:
@@ -502,21 +573,17 @@ if __name__ == '__main__':
     bpf_text = bpf_text.replace('LAYER_3_WEIGHT', str(len(params["layer_3_weight"])))
     bpf_text = bpf_text.replace('DATA_MIN', str(len(params["data_min"])))
     bpf_text = bpf_text.replace('DATA_SCALE', str(len(params["data_scale"])))
-
-    print(offload_device)
-
+    # --- Tạo thư mục log nếu chưa có ---
+    if os.path.dirname(log_file):
+        os.makedirs(os.path.dirname(log_file), exist_ok=True)
     ret = []  
     # b = BPF(text=bpf_text, debug=0,  cflags=["-w", "-DMAPTYPE={maptype}"],
     b = BPF(text=bpf_text, debug=0,  cflags=["-w"],
             # allow_rlimit=True,
             device=offload_device)
-    # for i in range(0, lib.bpf_num_functions(b.module)):
-    #     func_name = lib.bpf_function_name(b.module, i)
-    #     print(func_name, lib.bpf_function_size(b.module, func_name))
     try:
         fn = b.load_func("nn_xdp_drop_packet", BPF.XDP)
         b.attach_xdp(device, fn, flags=flags)
-
         jmp_table = b.get_table("jmp_table")
         nn1_fn = b.load_func("nn1", BPF.XDP);
         nn2_fn = b.load_func("nn2", BPF.XDP);
@@ -558,65 +625,50 @@ if __name__ == '__main__':
         prev = 0
         interval = 120
         start = datetime.now()
-        prev_total_bytes = 0
-        prev_total_pkts  = 0
-        latencies = []
+        # Các biến lưu trạng thái trước
+        ret = []
+        # Lấy các bảng cần thiết
+        acct_map = b.get_table("accounting_map")
 
-        while True:
-            try:
-                dropcnt.clear()
-                start1 = datetime.now()
-                total_bytes = 0
-                total_pkts = 0
-                interval_latencies = []
+        # Ghi header CSV
+        with open(log_file, 'w', buffering=1) as f:
+            f.write("Throughput_Mbps,Avg_Latency_ns,PPS\n")
 
-                # sleep 1 giây, trong khi BPF update dropcnt và features
-                time.sleep(1)
-                end = datetime.now()
+        interval_sec = 1
+        duration_sec = 120
+        start_time = time.time()
+        end_time = start_time + duration_sec
+        # Đọc giá trị đầu tiên
+        prev_acc = read_accounting(acct_map)
+        prev_time = time.time()
 
-                # Lấy tất cả session để tính throughput & latency
-                sessions = b.get_table("sessions")
-                for k, leaf in sessions.items():
-                    total_pkts  += leaf.num_packets
-                    total_bytes += leaf.features[0]  # tổng bytes
-                    if leaf.num_packets > 1:
-                        # dùng tính trung bình delta timestamp (ns)
-                        interval_latencies.append(leaf.features[1] / leaf.num_packets)
+        print("Bắt đầu đo trong 120 giây...\n")
 
-                # Throughput Mbps
-                duration_sec = (end - start1).total_seconds()
-                delta_bytes = abs(total_bytes - prev_total_bytes)
-                if delta_bytes < 0:
-                  delta_bytes = 0
-                  print(f"[WARN] total_bytes reset? prev={prev_total_bytes}, now={total_bytes}")
-                  
-                throughput_mbps = (delta_bytes * 8) / (duration_sec * 1e6)
-                prev_total_bytes = total_bytes
+        while time.time() < end_time:
+            time.sleep(interval_sec)
 
-                # Latency trung bình (microseconds)
-                avg_latency_us = 0
-                if interval_latencies:
-                    avg_latency_us = sum(interval_latencies)/len(interval_latencies)/1000.0
+            now_acc = read_accounting(acct_map)
+            now_time = time.time()
 
-                print(f"Drop PPS: {[int(v.value/duration_sec) for k,v in dropcnt.items()]}, "
-                      f"Throughput: {throughput_mbps:.2f} Mbps, "
-                      f"Avg Latency: {avg_latency_us:.2f} us")
+            throughput_bps, lat_ns, pps = compute_metrics(
+                prev_acc, now_acc, now_time - prev_time
+            )
+            throughput_mbps = throughput_bps * 8 / 1e6  # B/s -> Mbps
 
-                ret.append((throughput_mbps, avg_latency_us))
+            ret.append((throughput_mbps, lat_ns, pps))
 
-                # Thoát sau interval giây
-                if (end - start).total_seconds() > interval:
-                    break
+            # Ghi dòng vào CSV ngay lập tức
+            with open(log_file, 'a', buffering=1) as f:
+                f.write(f"{throughput_mbps:.2f},{lat_ns:.2f},{pps:.1f}\n")
 
-            except KeyboardInterrupt:
-                filename = log_file
-                os.makedirs(os.path.dirname(filename), exist_ok=True)
-                with open (filename, 'w') as f:
-                    for d in ret:
-                        f.write(f"{d}\n")
-                break
+            prev_acc = now_acc
+            prev_time = now_time
+
+    except KeyboardInterrupt:
+        print("\nĐã nhận Ctrl+C, kết thúc đo.", flush=True)
     finally:
         b.remove_xdp(device, flags)
+        print(f"Kết quả đã lưu vào {log_file}", flush=True)
         # filename = log_file
         # if "-S" in sys.argv:
         #     # XDP_FLAGS_SKB_MODE
