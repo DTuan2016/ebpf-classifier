@@ -34,7 +34,7 @@ bpf_text = """
 #define ROUND_CONST (1 << (FXP_VALUE - 1)) // = 0.5 to before right shifting to improve rounding
 // mlp_params.h
 #define N 1
-#define INPUT_DIM 12
+#define INPUT_DIM 6
 #define H1 16
 #define H2 16
 #define OUTPUT_DIM 2
@@ -48,21 +48,14 @@ struct pkt_key_t {
 };
 
 struct pkt_leaf_t {
-  u32 num_packets;
-  u64 last_packet_timestamp;
-  u32 sport;
-  u32 dport;
-  u64 features[6];
+  u64 start_ts;
+  u64 last_seen;
+  u64 min_IAT;
+  u32 total_pkts;
+  u32 max_pkt_len;
+  u32 min_pkt_len;
+  u32 total_bytes;
 };
-
-struct pkt_leaf_t {
-  u32 num_packets;
-  u64 last_packet_timestamp;
-  u32 sport;
-  u32 dport;
-  u64 features[6];
-};
-
 
 struct accounting{
   u64 time_in;
@@ -94,82 +87,6 @@ BPF_TABLE("lru_hash", struct pkt_key_t, struct pkt_leaf_t, sessions, 1024);
 BPF_TABLE("prog", int, int, jmp_table, 8);
 BPF_HASH(dropcnt, int, u32);
 
-
-// static __always_inline int ip_decrease_ttl(struct iphdr *iph)
-// {
-//     u32 check = (__force u32)iph->check;
-// 
-//     check += (__force u32)htons(0x0100);
-//     iph->check = (__force __sum16)(check + (check >= 0xFFFF));
-//     return --iph->ttl;
-// }
-// int forward(struct xdp_md *ctx) {
-//   void* data_end = (void*)(long)ctx->data_end;
-//   void* data = (void*)(long)ctx->data;
-//   struct ethhdr *eth = data;
-//   u64 nh_off = sizeof(*eth);
-//   struct iphdr *iph;
-//   struct tcphdr *th;
-//   struct udphdr *uh;
-//   int _zero = 0;
-//   int64_t _zero64 = 0;
-// 
-//   ethernet: {
-//     if (data + nh_off > data_end) {
-//       return XDP_DROP;
-//     }
-//     goto ip;
-//   }
-//   ip: {
-//     iph = data + nh_off;
-//     if ((void*)&iph[1] > data_end)
-//       return XDP_DROP;
-//     goto forward;
-//   }
-//   forward: {
-//     struct bpf_fib_lookup fib_params = {};
-//     if (iph->ttl <= 1) {
-//         return XDP_PASS;
-//     }
-//     __builtin_memset(&fib_params, 0, sizeof(fib_params));
-//     if (eth->h_proto == htons(ETH_P_IP)) {
-//         if ((void*)&iph[1] > data_end) {
-//             return XDP_DROP;
-//         }
-//         fib_params.family = AF_INET;
-//         fib_params.tos = iph->tos;
-//         fib_params.l4_protocol = iph->protocol;
-//         fib_params.sport = 0;
-//         fib_params.dport = 0;
-//         fib_params.tot_len = bpf_ntohs(iph->tot_len);
-//         fib_params.ipv4_src = iph->saddr;
-//         fib_params.ipv4_dst = iph->daddr;
-//         fib_params.ifindex = ctx->ingress_ifindex;
-//     } else {
-//         return XDP_PASS;
-//     }
-//     long rc;
-//     rc = bpf_fib_lookup(ctx, &fib_params, sizeof(fib_params), BPF_FIB_LOOKUP_DIRECT);
-//     switch(rc) {
-//     case BPF_FIB_LKUP_RET_SUCCESS:
-//         ip_decrease_ttl(iph);
-//         __builtin_memcpy(eth->h_dest, fib_params.dmac, ETH_ALEN);
-//         __builtin_memcpy(eth->h_source, fib_params.smac, ETH_ALEN);
-//         return bpf_redirect(fib_params.ifindex, 0);
-//     case BPF_FIB_LKUP_RET_BLACKHOLE:
-//     case BPF_FIB_LKUP_RET_UNREACHABLE:
-//     case BPF_FIB_LKUP_RET_PROHIBIT:
-//         return XDP_DROP;
-//     case BPF_FIB_LKUP_RET_NOT_FWDED:
-//     case BPF_FIB_LKUP_RET_FWD_DISABLED:
-//     case BPF_FIB_LKUP_RET_UNSUPP_LWT:
-//     case BPF_FIB_LKUP_RET_NO_NEIGH:
-//     case BPF_FIB_LKUP_RET_FRAG_NEEDED:
-//         return XDP_PASS;
-//     }
-//   }
-//   return XDP_PASS;
-// }
 int nn1(struct xdp_md *ctx) {
   unsigned int k, m, _k, _m;
   int _zero = 0;
@@ -290,7 +207,7 @@ int nn2(struct xdp_md *ctx) {
   
   u32 key_ac = 0;
   struct accounting *acct = accounting_map.lookup(&key_ac);
-  struct accounting zero_ac = {};
+  struct accounting zero_ac =  {};
   if(!acct){
     accounting_map.update(&key_ac, &zero_ac);
     acct = accounting_map.lookup(&key_ac);
@@ -303,7 +220,7 @@ int nn2(struct xdp_md *ctx) {
   return XDP_PASS;
 }
 int nn_xdp_drop_packet(struct xdp_md *ctx) {
-  int64_t ts = bpf_ktime_get_ns();
+  u64 ts = bpf_ktime_get_ns();
   void* data_end = (void*)(long)ctx->data_end;
   void* data = (void*)(long)ctx->data;
   struct ethhdr *eth = data;
@@ -367,11 +284,15 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
   nn: {
     struct pkt_leaf_t *pkt_leaf = sessions.lookup(&pkt_key);
     if (!pkt_leaf) {
+      u64 pkt_len_zero = ntohs(iph->tot_len);
       struct pkt_leaf_t zero = {};
-      zero.sport = pkt_key.sport;
-      zero.dport = pkt_key.dport;
-      zero.num_packets = 0;
-      zero.last_packet_timestamp = ts;
+      zero.start_ts = ts;
+      zero.last_seen = ts;
+      zero.min_IAT = 0xFFFFFFFFFFFFFFFFULL;
+      zero.min_pkt_len = pkt_len_zero;
+      zero.max_pkt_len = pkt_len_zero;
+      zero.total_pkts = 1;
+      zero.total_bytes = pkt_len_zero;
       sessions.update(&pkt_key, &zero);
       pkt_leaf = sessions.lookup(&pkt_key);
     }
@@ -379,7 +300,7 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
       u32 key_ac = 0;
       struct accounting *acct = accounting_map.lookup(&key_ac);
       struct accounting zero_ac =  {};
-      u64 pkt_len = 0;
+      u64 pkt_len = ntohs(iph->tot_len);
       if(!acct){
         accounting_map.update(&key_ac, &zero_ac);
         acct = accounting_map.lookup(&key_ac);
@@ -387,43 +308,39 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
       if(acct){
         acct->time_in = bpf_ktime_get_ns();
       }
-      int64_t x[INPUT_DIM] = {0};
-      pkt_leaf->num_packets += 1;
-      x[0] = pkt_leaf->sport;
-      x[1] = pkt_leaf->dport;
-      x[2] = iph->protocol;
-      x[3] = ntohs(iph->tot_len);
-      pkt_len = (__u64)x[3];
-      x[4] = 0;
-      if (pkt_leaf->last_packet_timestamp > 0) {
-        x[4] = ts - pkt_leaf->last_packet_timestamp;
+      u64 x[INPUT_DIM] = {0};
+      u64 iat_ns = (pkt_leaf->last_seen > 0 && ts >= pkt_leaf->last_seen) ? (ts - pkt_leaf->last_seen) : 0;
+      pkt_leaf->total_bytes += pkt_len;
+      pkt_leaf->total_pkts += 1;
+      
+      if(iat_ns > 0 && iat_ns < pkt_leaf->min_IAT){
+        pkt_leaf->min_IAT = iat_ns;
       }
-      pkt_leaf->last_packet_timestamp = ts;
-      x[5] = pkt_key.sport == x[0];
-
+      
+      if(pkt_len > pkt_leaf->max_pkt_len){
+        pkt_leaf->max_pkt_len = pkt_len;
+      }
+      
+      if(pkt_len < pkt_leaf->min_pkt_len){
+        pkt_leaf->min_pkt_len = pkt_len;
+      }
+      
+      pkt_leaf->last_seen = ts;
+      
+      x[0] = pkt_leaf->last_seen - pkt_leaf->start_ts;
+      x[1] = pkt_leaf->total_pkts;
+      x[2] = pkt_leaf->total_bytes;
+      x[3] = pkt_leaf->max_pkt_len;
+      x[4] = pkt_leaf->min_pkt_len;
+      x[5] = pkt_leaf->min_IAT;
+      
       x[0] <<= FXP_VALUE;
       x[1] <<= FXP_VALUE;
       x[2] <<= FXP_VALUE;
       x[3] <<= FXP_VALUE;
       x[4] <<= FXP_VALUE;
       x[5] <<= FXP_VALUE;
-
-      pkt_leaf->features[0] += x[3];
-      pkt_leaf->features[1] += x[4];
-      pkt_leaf->features[2] += x[5];
-
-      x[6] = pkt_leaf->features[0]/pkt_leaf->num_packets;
-      x[7] = pkt_leaf->features[1]/pkt_leaf->num_packets;
-      x[8] = pkt_leaf->features[2]/pkt_leaf->num_packets;
-
-      pkt_leaf->features[3] += abs(x[3] - x[6]);
-      pkt_leaf->features[4] += abs(x[4] - x[7]);
-      pkt_leaf->features[5] += abs(x[5] - x[8]);
-
-      x[9]  = pkt_leaf->features[3]/pkt_leaf->num_packets;
-      x[10] = pkt_leaf->features[4]/pkt_leaf->num_packets;
-      x[11] = pkt_leaf->features[5]/pkt_leaf->num_packets;
-
+      
       unsigned int k, m, _k, _m;
 
       sessions.update(&pkt_key, pkt_leaf);
@@ -492,7 +409,6 @@ int nn_xdp_drop_packet(struct xdp_md *ctx) {
   }
   return XDP_PASS;
 }
-
 """
 
 def map_bpf_table(hashmap, values, c_type='int'):
